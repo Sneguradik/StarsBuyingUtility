@@ -87,9 +87,20 @@ public class AutoBuyingService(ILogger<AutoBuyingService> logger, ITelegramGiftB
 
         logger.LogInformation("📄 Обрабатываю инвойс #{InvoiceId}, осталось купить {Amount} шт.",
             invoice.Id, invoice.Amount);
+
+        var buyGifts = suitableGifts.Take(invoice.Amount).ToList();
+
+        if (buyGifts.Count < invoice.Amount)
+        {
+            var index = 0;
+            while (buyGifts.Count < invoice.Amount && suitableGifts.Length > 0)
+            {
+                buyGifts.Add(suitableGifts[index % suitableGifts.Length]);
+                index++;
+            }
+        }
         
-        
-        var buyTasks = suitableGifts.Take(invoice.Amount)
+        var buyTasks = buyGifts
             .Select(gift => telegramGiftBuyer.BuyGiftAsync(gift, invoice.RecipientId, invoice.RecipientType, cancellationToken))
             .ToArray();
 
