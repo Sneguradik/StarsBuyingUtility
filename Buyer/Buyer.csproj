@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <UserSecretsId>dotnet-Buyer-9893d603-175c-46a9-92a5-0f4b123a784c</UserSecretsId>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.6"/>
+        <PackageReference Include="TDLib" Version="1.8.45" />
+        <PackageReference Include="tdlib.native.osx-arm64" Version="1.8.45" />
+    </ItemGroup>
+</Project>
