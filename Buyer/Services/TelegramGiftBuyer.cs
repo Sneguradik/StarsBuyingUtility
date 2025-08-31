@@ -1,4 +1,7 @@
+using System.Text.Json;
+using Buyer.Configuration;
 using Buyer.Models;
+using Microsoft.Extensions.Options;
 using TdLib;
 using TdLib.Bindings;
 using TdLogLevel = TdLib.Bindings.TdLogLevel;
@@ -15,7 +18,7 @@ public interface ITelegramGiftBuyer
         CancellationToken cancellationToken = default);
 };
 
-public class TelegramGiftBuyer(ILogger<TelegramGiftBuyer> logger) : ITelegramGiftBuyer, IDisposable
+public class TelegramGiftBuyer(IOptions<BuyerConfig> conf,ILogger<TelegramGiftBuyer> logger) : ITelegramGiftBuyer, IDisposable
 {
     private readonly TdClient _client = new ();
     private bool _authNeeded;
@@ -40,10 +43,6 @@ public class TelegramGiftBuyer(ILogger<TelegramGiftBuyer> logger) : ITelegramGif
         if (starGiftsResult?.Gifts_ == null)
             return [];
         
-        var chat = await _client.GetChatsAsync(limit:20);
-        logger.LogInformation($"Found {chat.ChatIds.Length} chats");
-        
-
         return starGiftsResult.Gifts_.Select(g => new Gift
         {
             Id = g.Id,
@@ -62,28 +61,41 @@ public class TelegramGiftBuyer(ILogger<TelegramGiftBuyer> logger) : ITelegramGif
 
             if (type == RecipientType.Channel)
             {
-                sender = new TdApi.MessageSender.MessageSenderChat()  { ChatId = recipientId };
+                sender = new TdApi.MessageSender.MessageSenderChat() { ChatId = recipientId };
+                await _client.GetChatsAsync(null, 30);
             }
             else
                 sender = new TdApi.MessageSender.MessageSenderUser() { UserId = recipientId };
-            
+
             var exec = await _client.SendGiftAsync(
-                gift.Id, 
-                sender, 
-                new TdApi.FormattedText(){Text = $"Gift for {recipientId}"}, 
+                gift.Id,
+                sender,
+                new TdApi.FormattedText() { Text = $"Gift for {recipientId}" },
                 true, false);
 
 
             if (exec != null)
                 return new GiftTransaction
-                    { GiftId = gift.Id, RecipientId = recipientId, TransactionDate = DateTime.UtcNow, Price = (int)gift.Price };
-            
+                {
+                    GiftId = gift.Id, RecipientId = recipientId, TransactionDate = DateTime.UtcNow,
+                    Price = (int)gift.Price
+                };
+
             logger.LogInformation($"Gift {gift.Id} for {recipientId} failed");
+
             return null;
+        }
+        catch (TdException e)
+        {
+            logger.LogError(e, $"Failed to buy gift {gift.Id} | Price: {gift.Price} | Supply: {gift.CurrentSupply}/{gift.TotalSupply}");
+            logger.LogError(e, e.Message);
+            if (e.Message != "Unknown chat identifier specified") return null;
+            logger.LogInformation("Check");
+            return await BuyGiftAsync(gift, conf.Value.FallBackUserId, RecipientType.Account, cancellationToken);
         }
         catch (Exception e)
         {
-            logger.LogError(e, "Failed to buy gift {gift}", gift);
+            logger.LogError(e, $"Failed to buy gift {gift.Id} | Price: {gift.Price} | Supply: {gift.CurrentSupply}/{gift.TotalSupply}");
             logger.LogError(e, e.Message);
             return null;
         }

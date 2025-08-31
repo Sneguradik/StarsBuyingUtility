@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Buyer.Configuration;
 using Buyer.Models;
 using Microsoft.Extensions.Options;
@@ -9,114 +11,185 @@ public interface IAutoBuyingService
 {
     Task RunAsync(CancellationToken cancellationToken = default);
 }
-public class AutoBuyingService(ILogger<AutoBuyingService> logger, ITelegramGiftBuyer telegramGiftBuyer, IOptions<BuyerConfig> config): IAutoBuyingService
+public class AutoBuyingService(
+    ILogger<AutoBuyingService> logger,
+    ITelegramGiftBuyer telegramGiftBuyer,
+    IOptions<BuyerConfig> config) : IAutoBuyingService
 {
-    private HashSet<long> _knownGifts = new();
-    
+    private readonly object _knownLock = new();
+    private readonly HashSet<long> _knownGifts = new();
+
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         logger.LogInformation("🚀 AutoBuyingService запущен");
+        
+        var maxConcurrentInvoices = config.Value.MaxConcurrentInvoices > 0
+            ? config.Value.MaxConcurrentInvoices
+            : 3;
+        using var invoiceLimiter = new SemaphoreSlim(maxConcurrentInvoices, maxConcurrentInvoices);
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            IEnumerable<Gift> giftList = [];
+
             try
             {
-                logger.LogInformation($"{DateTime.Now:yyyy-MM-dd hh-mm-ss} Started checking");
-                var giftList = (await telegramGiftBuyer.GetAvailableGiftsAsync(cancellationToken)).ToArray();
+                logger.LogInformation("Started checking");
 
+                giftList = await telegramGiftBuyer.GetAvailableGiftsAsync(cancellationToken);
+
+                var (newIds, knownSnapshot) = UpdateKnownGifts(giftList.Select(g => g.Id));
+
+                LogFullReport(
+                    currentGiftIds: giftList.Select(g => g.Id),
+                    knownSnapshot: knownSnapshot,
+                    newIds: newIds,
+                    error: null);
                 
-                var giftsToBuy = giftList
-                    //.Where(x => !x.Limited || x.CurrentSupply>0)
-                    .Where(x => x is {  CurrentSupply: > 0 ,Limited: true })
-                    .ToArray();
+                var invoices = config.Value.GiftInvoices
+                    .Where(i => i.Amount > 0)
+                    .ToList();
 
-                if (giftsToBuy.Length == 0)
+                if (invoices.Count > 0)
                 {
-                    await Task.Delay(100, cancellationToken);
-                    continue;
-                }
-                
-                
-                var invoices = config.Value.GiftInvoices;
+                    var tasks = new List<Task>();
+                    foreach (var invoice in invoices)
+                    {
+                        tasks.Add(RunWithLimiterAsync(
+                            invoiceLimiter,
+                            () => ProcessInvoiceAsync(invoice, giftList, cancellationToken),
+                            cancellationToken));
+                    }
 
-                logger.LogInformation("📄 Загружено {Count} инвойсов для обработки", invoices.Count);
-                
-                var tasks = new List<Task>();
-                foreach (var invoice in invoices)
-                {
-                    tasks.Add(Task.Run(() => ProcessInvoiceAsync(invoice, giftsToBuy, cancellationToken), cancellationToken));
-                }
-
-                await Task.WhenAll(tasks);
+                    await Task.WhenAll(tasks);
                     
-
-                _knownGifts = giftList.Select(x => x.Id).ToHashSet();
-            }
-            catch (OperationCanceledException)
-            {
-                logger.LogInformation("⏹ AutoBuyingService остановлен по CancellationToken");
-                break;
+                    config.Value.GiftInvoices.RemoveAll(i => i.Amount <= 0);
+                }
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "❌ Ошибка в AutoBuyingService");
-                await Task.Delay(1000, cancellationToken);
+                logger.LogError(ex, "❌ Loop error: {Message}", ex.Message);
+
+                LogFullReport(
+                    currentGiftIds: giftList.Select(g => g.Id),
+                    knownSnapshot: SafeSnapshotKnown(),
+                    newIds: Enumerable.Empty<long>(),
+                    error: ex);
             }
         }
-        
-        
-        logger.LogInformation("✅ AutoBuyingService завершил работу");
     }
-    
-    private async Task ProcessInvoiceAsync(GiftInvoice invoice, Gift[] gifts, CancellationToken cancellationToken = default)
-    {
-        var suitableGiftsQuery = gifts
-            .Where(x => invoice.MinPrice <= x.Price && x.Price <= invoice.MaxPrice);
-        
-        if (invoice.MaxSupply is not null) suitableGiftsQuery = suitableGiftsQuery
-            .Where(x=>x.TotalSupply <= invoice.MaxSupply);
-            
-        
-        var suitableGifts = suitableGiftsQuery.OrderByDescending(x => x.Price).ToArray();
 
-        if (!suitableGifts.Any())
+    // helper: запускает задачу под семафором (не более N одновременно)
+    private static async Task RunWithLimiterAsync(
+        SemaphoreSlim limiter,
+        Func<Task> action,
+        CancellationToken ct)
+    {
+        await limiter.WaitAsync(ct);
+        try
         {
-            logger.LogDebug("Инвойс #{InvoiceId}: нет подходящих подарков", invoice.Id);
+            await action();
+        }
+        finally
+        {
+            limiter.Release();
+        }
+    }
+
+    // Заглушка: здесь твоя логика под конкретный инвойс (фильтрация gifts по цене и т.п.)
+    private async Task ProcessInvoiceAsync(
+        GiftInvoice invoice,
+        IEnumerable<Gift> allGifts,
+        CancellationToken ct)
+    {
+        // пример: только новые лимитированные с остатком (если уже отслеживаешь это)
+        var candidates = allGifts
+            .Where(g => g.Limited && g.CurrentSupply > 0) // можно сузить фильтр под стратегию
+            .Where(g => invoice.MinPrice <= g.Price && g.Price <= invoice.MaxPrice)
+            .Where(g => invoice.MaxSupply is null || g.TotalSupply <= invoice.MaxSupply)
+            .OrderByDescending(g => g.Price)
+            .Take(invoice.Amount)
+            .ToList();
+
+        if (!candidates.Any())
+        {
+            logger.LogDebug("Инвойс #{InvoiceId}: подходящих подарков нет", invoice.Id);
             return;
         }
 
-        logger.LogInformation("📄 Обрабатываю инвойс #{InvoiceId}, осталось купить {Amount} шт.",
-            invoice.Id, invoice.Amount);
+        logger.LogInformation("Инвойс #{InvoiceId}: начата обработка {Cnt} кандидатов (осталось {Left})",
+            invoice.Id, candidates.Count, invoice.Amount);
 
-        var buyGifts = suitableGifts.Take(invoice.Amount).ToList();
-
-        if (buyGifts.Count < invoice.Amount)
+        // тут можно вызвать твой BuyGiftAsync и уменьшать invoice.Amount по факту успеха
+        foreach (var gift in candidates)
         {
-            var index = 0;
-            while (buyGifts.Count < invoice.Amount && suitableGifts.Length > 0)
+            if (invoice.Amount <= 0) break;
+
+            try
             {
-                buyGifts.Add(suitableGifts[index % suitableGifts.Length]);
-                index++;
+                var res = await telegramGiftBuyer.BuyGiftAsync(gift, invoice.RecipientId, invoice.RecipientType, ct);
+                if (res is not null /* и/или res.Success */)
+                {
+                    invoice.Amount -= 1;
+                    logger.LogInformation("🎁 Куплен gift {GiftId} для инвойса #{InvoiceId}. Осталось {Left}",
+                        gift.Id, invoice.Id, invoice.Amount);
+                }
+                else
+                {
+                    logger.LogWarning("⚠️ Покупка gift {GiftId} отклонена/неуспешна для инвойса #{InvoiceId}",
+                        gift.Id, invoice.Id);
+                }
+            }
+            catch (Exception e)
+            {
+                logger.LogError(e, "❌ Ошибка покупки gift {GiftId} для инвойса #{InvoiceId}", gift.Id, invoice.Id);
             }
         }
-        
-        var buyTasks = buyGifts
-            .Select(gift => telegramGiftBuyer.BuyGiftAsync(gift, invoice.RecipientId, invoice.RecipientType, cancellationToken))
-            .ToArray();
 
-        var results = await Task.WhenAll(buyTasks);
-        var successful = results.Where(x => x is not null).Cast<GiftTransaction>().ToList();
+        logger.LogInformation("Инвойс #{InvoiceId}: завершена обработка. Осталось {Left}",
+            invoice.Id, invoice.Amount);
+    }
 
-        invoice.Amount -= successful.Count;
+    private (IEnumerable<long> newIds, IEnumerable<long> snapshotKnown) UpdateKnownGifts(IEnumerable<long> currentIds)
+    {
+        List<long> added = new();
 
-        logger.LogInformation("🎁 Куплено {Count} подарков для инвойса #{InvoiceId}",
-            successful.Count, invoice.Id);
-
-        if (invoice.Amount <= 0)
+        lock (_knownLock)
         {
-            config.Value.GiftInvoices.Remove(invoice);
-            logger.LogInformation("✅ Инвойс #{InvoiceId} полностью исполнен", invoice.Id);
+            foreach (var id in currentIds)
+                if (_knownGifts.Add(id)) added.Add(id);
+
+            var snap = _knownGifts.OrderBy(x => x).ToArray();
+            return (added, snap);
         }
-        
+    }
+
+    private IEnumerable<long> SafeSnapshotKnown()
+    {
+        lock (_knownLock)
+            return _knownGifts.OrderBy(x => x).ToArray();
+    }
+
+    private void LogFullReport(
+        IEnumerable<long> currentGiftIds,
+        IEnumerable<long> knownSnapshot,
+        IEnumerable<long> newIds,
+        Exception? error)
+    {
+        var payload = new
+        {
+            TsUtc = DateTimeOffset.UtcNow,
+            CurrentGiftIds = currentGiftIds.OrderBy(x => x).ToArray(),
+            KnownSetIds = knownSnapshot.OrderBy(x => x).ToArray(),
+            NewIds = newIds.Distinct().OrderBy(x => x).ToArray(),
+            Error = error is null ? null : new
+            {
+                Type = error.GetType().FullName,
+                error.Message,
+                error.StackTrace
+            }
+        };
+
+        logger.LogInformation("📑 FullReport {@Report}", payload);
     }
 }
